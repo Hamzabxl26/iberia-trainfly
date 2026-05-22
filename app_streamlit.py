@@ -4,14 +4,23 @@ import pandas as pd
 import streamlit as st
 from datetime import date
 
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+# Leer clave desde Streamlit Cloud Secrets o desde .env local
+SERPAPI_KEY = None
 
-# Charge .env sans dépendance externe
+try:
+    SERPAPI_KEY = st.secrets.get("SERPAPI_KEY")
+except Exception:
+    pass
+
+if not SERPAPI_KEY:
+    SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+
 if not SERPAPI_KEY and os.path.exists(".env"):
     with open(".env", "r", encoding="utf-8") as f:
         for line in f:
             if line.startswith("SERPAPI_KEY="):
-                SERPAPI_KEY = line.strip().split("=", 1)[1]
+                SERPAPI_KEY = line.strip().split("=", 1)[1].strip().strip('"')
+
 
 STATIONS = [
     {"city": "Málaga María Zambrano", "code": "YJM"},
@@ -36,15 +45,17 @@ STATIONS = [
     {"city": "Albacete", "code": "EEM"},
 ]
 
+
 def google_flights_link(origin, destination, travel_date):
     return (
         "https://www.google.com/travel/flights"
         f"?q=Flights%20from%20{origin}%20to%20{destination}%20on%20{travel_date}"
     )
 
+
 def serpapi_google_flights(origin, destination, travel_date):
     if not SERPAPI_KEY:
-        raise RuntimeError("SERPAPI_KEY manquante dans .env")
+        raise RuntimeError("Falta la SERPAPI_KEY.")
 
     params = {
         "engine": "google_flights",
@@ -54,15 +65,20 @@ def serpapi_google_flights(origin, destination, travel_date):
         "outbound_date": travel_date,
         "type": "2",
         "currency": "EUR",
-        "hl": "fr",
+        "hl": "es",
         "gl": "be",
         "adults": "1",
         "show_hidden": "true",
     }
 
-    r = requests.get("https://serpapi.com/search", params=params, timeout=90)
-    r.raise_for_status()
-    return r.json()
+    response = requests.get(
+        "https://serpapi.com/search",
+        params=params,
+        timeout=90,
+    )
+    response.raise_for_status()
+    return response.json()
+
 
 def flatten_results(data, origin, destination, travel_date, label):
     rows = []
@@ -88,212 +104,290 @@ def flatten_results(data, origin, destination, travel_date, label):
         airlines = []
         flight_numbers = []
 
-        for f in flights:
-            dep = f.get("departure_airport", {}) or {}
-            arr = f.get("arrival_airport", {}) or {}
+        for flight in flights:
+            dep = flight.get("departure_airport", {}) or {}
+            arr = flight.get("arrival_airport", {}) or {}
+
             dep_code = dep.get("id", "")
             arr_code = arr.get("id", "")
             dep_time = dep.get("time", "")
             arr_time = arr.get("time", "")
-            airline = f.get("airline", "")
-            flight_number = f.get("flight_number", "")
+
+            airline = flight.get("airline", "")
+            flight_number = flight.get("flight_number", "")
 
             if airline:
                 airlines.append(airline)
             if flight_number:
                 flight_numbers.append(flight_number)
 
-            route_parts.append(f"{dep_code} {dep_time} → {arr_code} {arr_time}")
-
-        booking_url = google_flights_link(origin, destination, travel_date)
+            route_parts.append(
+                f"{dep_code} {dep_time} → {arr_code} {arr_time}"
+            )
 
         rows.append({
-            "type_recherche": label,
-            "date": travel_date,
-            "origine": origin,
-            "destination": destination,
-            "prix": price,
-            "devise": "EUR",
-            "depart": (first.get("departure_airport", {}) or {}).get("time", ""),
-            "arrivee": (last.get("arrival_airport", {}) or {}).get("time", ""),
-            "duree_min": total_duration,
-            "compagnies": ", ".join(sorted(set(airlines))),
-            "vols": ", ".join(flight_numbers),
-            "itineraire": " | ".join(route_parts),
+            "tipo_busqueda": label,
+            "fecha": travel_date,
+            "origen": origin,
+            "destino": destination,
+            "precio": price,
+            "moneda": "EUR",
+            "salida": (first.get("departure_airport", {}) or {}).get("time", ""),
+            "llegada": (last.get("arrival_airport", {}) or {}).get("time", ""),
+            "duracion_min": total_duration,
+            "companias": ", ".join(sorted(set(airlines))),
+            "vuelos": ", ".join(flight_numbers),
+            "itinerario": " | ".join(route_parts),
             "booking_token": booking_token or "",
             "departure_token": departure_token or "",
-            "lien_google_flights": booking_url,
+            "enlace_google_flights": google_flights_link(
+                origin, destination, travel_date
+            ),
         })
 
     return rows
 
+
 def lowest_price(rows):
-    prices = [r["prix"] for r in rows if isinstance(r.get("prix"), (int, float))]
+    prices = [
+        row["precio"]
+        for row in rows
+        if isinstance(row.get("precio"), (int, float))
+    ]
     return min(prices) if prices else None
 
-st.set_page_config(page_title="Iberia Train&Fly Google Flights", layout="wide")
 
-st.title("Iberia Train&Fly Screener — Google Flights / SerpApi")
+st.set_page_config(
+    page_title="Comparador Iberia Train&Fly",
+    layout="wide",
+)
+
+st.title("Comparador Iberia Train&Fly — Google Flights / SerpApi")
 
 if not SERPAPI_KEY:
-    st.error("SERPAPI_KEY manquante. Mets-la dans le fichier .env")
+    st.error(
+        "Falta la SERPAPI_KEY. Añádela en Streamlit Cloud: "
+        "Manage app → Settings → Secrets."
+    )
     st.stop()
 
-st.caption("Source prix : SerpApi Google Flights. Pas d'ouverture automatique Iberia.")
+st.caption(
+    "Fuente de precios: SerpApi Google Flights. "
+    "La aplicación compara vuelos directos con trayectos Train&Fly vía Madrid."
+)
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    travel_date = st.date_input("Date", value=date.today()).isoformat()
+    travel_date = st.date_input(
+        "Fecha",
+        value=date.today(),
+    ).isoformat()
 
 with col2:
     direction = st.selectbox(
-        "Sens",
-        ["BRU → Espagne via MAD", "Espagne → BRU via MAD", "Les deux"],
+        "Sentido",
+        [
+            "BRU → España vía MAD",
+            "España → BRU vía MAD",
+            "Ambos sentidos",
+        ],
         index=2,
     )
 
 with col3:
-    max_stations = st.number_input("Nombre max de gares à scanner", min_value=1, max_value=len(STATIONS), value=3)
+    max_stations = st.number_input(
+        "Número máximo de estaciones",
+        min_value=1,
+        max_value=len(STATIONS),
+        value=3,
+    )
 
-station_labels = [f"{s['code']} — {s['city']}" for s in STATIONS]
+station_labels = [
+    f"{station['code']} — {station['city']}"
+    for station in STATIONS
+]
+
 selected_labels = st.multiselect(
-    "Gares à scanner",
+    "Estaciones a analizar",
     station_labels,
-    default=station_labels[:int(max_stations)],
+    default=station_labels[: int(max_stations)],
 )
 
-selected = []
+selected_stations = []
 for label in selected_labels:
     code = label.split(" — ", 1)[0]
-    selected.append(next(s for s in STATIONS if s["code"] == code))
+    selected_stations.append(
+        next(station for station in STATIONS if station["code"] == code)
+    )
 
 st.warning(
-    "Important : Google Flights peut ne pas reconnaître tous les codes de gares ferroviaires. "
-    "Si une gare renvoie zéro résultat, ce n'est pas forcément ton script : c'est Google."
+    "Google Flights puede no reconocer todos los códigos ferroviarios. "
+    "Si una estación no devuelve resultados, no significa necesariamente que el trayecto no exista."
 )
 
-if st.button("Scanner les prix Google Flights", type="primary"):
+if st.button("Buscar precios en Google Flights", type="primary"):
     all_rows = []
     summary_rows = []
 
-    progress = st.progress(0)
-    total_jobs = len(selected)
-    if direction == "Les deux":
+    total_jobs = len(selected_stations)
+    if direction == "Ambos sentidos":
         total_jobs *= 2
 
     job = 0
+    progress = st.progress(0)
 
-    # Prix de référence
     ref_out_rows = []
     ref_in_rows = []
 
-    if direction in ["BRU → Espagne via MAD", "Les deux"]:
-        with st.status("Recherche référence BRU → MAD..."):
+    if direction in ["BRU → España vía MAD", "Ambos sentidos"]:
+        with st.status("Buscando referencia BRU → MAD..."):
             data_ref_out = serpapi_google_flights("BRU", "MAD", travel_date)
-            ref_out_rows = flatten_results(data_ref_out, "BRU", "MAD", travel_date, "REF BRU-MAD")
+            ref_out_rows = flatten_results(
+                data_ref_out,
+                "BRU",
+                "MAD",
+                travel_date,
+                "REFERENCIA BRU-MAD",
+            )
             all_rows.extend(ref_out_rows)
 
-    if direction in ["Espagne → BRU via MAD", "Les deux"]:
-        with st.status("Recherche référence MAD → BRU..."):
+    if direction in ["España → BRU vía MAD", "Ambos sentidos"]:
+        with st.status("Buscando referencia MAD → BRU..."):
             data_ref_in = serpapi_google_flights("MAD", "BRU", travel_date)
-            ref_in_rows = flatten_results(data_ref_in, "MAD", "BRU", travel_date, "REF MAD-BRU")
+            ref_in_rows = flatten_results(
+                data_ref_in,
+                "MAD",
+                "BRU",
+                travel_date,
+                "REFERENCIA MAD-BRU",
+            )
             all_rows.extend(ref_in_rows)
 
     ref_out_price = lowest_price(ref_out_rows)
     ref_in_price = lowest_price(ref_in_rows)
 
-    for station in selected:
+    for station in selected_stations:
         code = station["code"]
         city = station["city"]
 
-        if direction in ["BRU → Espagne via MAD", "Les deux"]:
+        if direction in ["BRU → España vía MAD", "Ambos sentidos"]:
             job += 1
             progress.progress(job / total_jobs)
-            with st.status(f"Recherche BRU → {city} ({code})..."):
+
+            with st.status(f"Buscando BRU → {city} ({code})..."):
                 try:
                     data = serpapi_google_flights("BRU", code, travel_date)
-                    rows = flatten_results(data, "BRU", code, travel_date, f"BRU-{code}")
+                    rows = flatten_results(
+                        data,
+                        "BRU",
+                        code,
+                        travel_date,
+                        f"BRU-{code}",
+                    )
                     all_rows.extend(rows)
+
                     combo_price = lowest_price(rows)
-                    saving = None
+                    difference = None
+
                     if combo_price is not None and ref_out_price is not None:
-                        saving = ref_out_price - combo_price
+                        difference = ref_out_price - combo_price
+
                     summary_rows.append({
-                        "sens": "BRU → Espagne",
-                        "gare": city,
-                        "code": code,
-                        "prix_ref_BRU_MAD": ref_out_price,
-                        "prix_trainfly_min": combo_price,
-                        "difference": saving,
-                        "statut": "Train&Fly moins cher" if saving is not None and saving > 0 else "Pas moins cher / inconnu",
-                        "lien": google_flights_link("BRU", code, travel_date),
-                    })
-                except Exception as e:
-                    summary_rows.append({
-                        "sens": "BRU → Espagne",
-                        "gare": city,
-                        "code": code,
-                        "prix_ref_BRU_MAD": ref_out_price,
-                        "prix_trainfly_min": None,
-                        "difference": None,
-                        "statut": f"Erreur: {e}",
-                        "lien": google_flights_link("BRU", code, travel_date),
+                        "sentido": "BRU → España",
+                        "estacion": city,
+                        "codigo": code,
+                        "precio_referencia_BRU_MAD": ref_out_price,
+                        "precio_trainfly_minimo": combo_price,
+                        "diferencia": difference,
+                        "estado": (
+                            "Train&Fly más barato"
+                            if difference is not None and difference > 0
+                            else "No es más barato / desconocido"
+                        ),
+                        "enlace": google_flights_link("BRU", code, travel_date),
                     })
 
-        if direction in ["Espagne → BRU via MAD", "Les deux"]:
+                except Exception as exc:
+                    summary_rows.append({
+                        "sentido": "BRU → España",
+                        "estacion": city,
+                        "codigo": code,
+                        "precio_referencia_BRU_MAD": ref_out_price,
+                        "precio_trainfly_minimo": None,
+                        "diferencia": None,
+                        "estado": f"Error: {exc}",
+                        "enlace": google_flights_link("BRU", code, travel_date),
+                    })
+
+        if direction in ["España → BRU vía MAD", "Ambos sentidos"]:
             job += 1
             progress.progress(job / total_jobs)
-            with st.status(f"Recherche {city} ({code}) → BRU..."):
+
+            with st.status(f"Buscando {city} ({code}) → BRU..."):
                 try:
                     data = serpapi_google_flights(code, "BRU", travel_date)
-                    rows = flatten_results(data, code, "BRU", travel_date, f"{code}-BRU")
+                    rows = flatten_results(
+                        data,
+                        code,
+                        "BRU",
+                        travel_date,
+                        f"{code}-BRU",
+                    )
                     all_rows.extend(rows)
+
                     combo_price = lowest_price(rows)
-                    saving = None
+                    difference = None
+
                     if combo_price is not None and ref_in_price is not None:
-                        saving = ref_in_price - combo_price
+                        difference = ref_in_price - combo_price
+
                     summary_rows.append({
-                        "sens": "Espagne → BRU",
-                        "gare": city,
-                        "code": code,
-                        "prix_ref_MAD_BRU": ref_in_price,
-                        "prix_trainfly_min": combo_price,
-                        "difference": saving,
-                        "statut": "Train&Fly moins cher" if saving is not None and saving > 0 else "Pas moins cher / inconnu",
-                        "lien": google_flights_link(code, "BRU", travel_date),
+                        "sentido": "España → BRU",
+                        "estacion": city,
+                        "codigo": code,
+                        "precio_referencia_MAD_BRU": ref_in_price,
+                        "precio_trainfly_minimo": combo_price,
+                        "diferencia": difference,
+                        "estado": (
+                            "Train&Fly más barato"
+                            if difference is not None and difference > 0
+                            else "No es más barato / desconocido"
+                        ),
+                        "enlace": google_flights_link(code, "BRU", travel_date),
                     })
-                except Exception as e:
+
+                except Exception as exc:
                     summary_rows.append({
-                        "sens": "Espagne → BRU",
-                        "gare": city,
-                        "code": code,
-                        "prix_ref_MAD_BRU": ref_in_price,
-                        "prix_trainfly_min": None,
-                        "difference": None,
-                        "statut": f"Erreur: {e}",
-                        "lien": google_flights_link(code, "BRU", travel_date),
+                        "sentido": "España → BRU",
+                        "estacion": city,
+                        "codigo": code,
+                        "precio_referencia_MAD_BRU": ref_in_price,
+                        "precio_trainfly_minimo": None,
+                        "diferencia": None,
+                        "estado": f"Error: {exc}",
+                        "enlace": google_flights_link(code, "BRU", travel_date),
                     })
 
     df_summary = pd.DataFrame(summary_rows)
     df_all = pd.DataFrame(all_rows)
 
-    st.subheader("Résumé comparatif")
+    st.subheader("Resumen comparativo")
     st.dataframe(df_summary, use_container_width=True)
 
     st.download_button(
-        "Télécharger résumé CSV",
+        "Descargar resumen CSV",
         df_summary.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"resume_trainfly_{travel_date}.csv",
+        file_name=f"resumen_trainfly_{travel_date}.csv",
         mime="text/csv",
     )
 
-    st.subheader("Tous les vols / horaires trouvés")
+    st.subheader("Todos los vuelos y horarios encontrados")
     st.dataframe(df_all, use_container_width=True)
 
     st.download_button(
-        "Télécharger tous les vols CSV",
+        "Descargar todos los vuelos CSV",
         df_all.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"tous_les_vols_trainfly_{travel_date}.csv",
+        file_name=f"todos_los_vuelos_trainfly_{travel_date}.csv",
         mime="text/csv",
     )
