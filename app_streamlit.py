@@ -56,7 +56,10 @@ def daterange(start_date, end_date):
 
 def google_flights_link(origin, destination, outbound_date, return_date=None):
     if return_date:
-        query = f"Flights from {origin} to {destination} on {outbound_date} returning {return_date}"
+        query = (
+            f"Flights from {origin} to {destination} "
+            f"on {outbound_date} returning {return_date}"
+        )
     else:
         query = f"Flights from {origin} to {destination} on {outbound_date}"
 
@@ -156,15 +159,6 @@ def flatten_results(data, origin, destination, outbound_date, return_date, label
     return rows
 
 
-def lowest_price(rows):
-    prices = [
-        row["precio"]
-        for row in rows
-        if isinstance(row.get("precio"), (int, float))
-    ]
-    return min(prices) if prices else None
-
-
 def best_row(rows):
     valid = [
         row for row in rows
@@ -172,10 +166,19 @@ def best_row(rows):
     ]
     if not valid:
         return None
-    return min(valid, key=lambda r: r["precio"])
+
+    return min(valid, key=lambda row: row["precio"])
 
 
-def search_best_roundtrip_range(origin, destination, outbound_start, outbound_end, return_start, return_end, label):
+def search_best_roundtrip_range(
+    origin,
+    destination,
+    outbound_start,
+    outbound_end,
+    return_start,
+    return_end,
+    label,
+):
     all_rows = []
     best = None
     errors = []
@@ -205,13 +208,46 @@ def search_best_roundtrip_range(origin, destination, outbound_start, outbound_en
                 all_rows.extend(rows)
 
                 candidate = best_row(rows)
-                if candidate and (best is None or candidate["precio"] < best["precio"]):
+                if candidate and (
+                    best is None or candidate["precio"] < best["precio"]
+                ):
                     best = candidate
 
             except Exception as exc:
                 errors.append(f"{outbound_date}/{return_date}: {exc}")
 
     return best, all_rows, errors
+
+
+def make_routes(direction_label, station_code):
+    """
+    Retourne les routes à comparer selon le sens choisi.
+
+    1) BRU → España / España → BRU
+       Référence : BRU ↔ MAD
+       Combo     : BRU ↔ station espagnole
+
+    2) España → BRU / BRU → España
+       Référence : MAD ↔ BRU
+       Combo     : station espagnole ↔ BRU
+    """
+
+    if direction_label == "BRU → España / España → BRU":
+        return {
+            "ref_origin": "BRU",
+            "ref_destination": "MAD",
+            "combo_origin": "BRU",
+            "combo_destination": station_code,
+            "direction_short": "BRU → España",
+        }
+
+    return {
+        "ref_origin": "MAD",
+        "ref_destination": "BRU",
+        "combo_origin": station_code,
+        "combo_destination": "BRU",
+        "direction_short": "España → BRU",
+    }
 
 
 # ---------- UI ----------
@@ -231,7 +267,17 @@ if not SERPAPI_KEY:
     st.stop()
 
 st.caption(
-    "Compara vuelos BRU ↔ MAD con billetes Train&Fly BRU ↔ estaciones españolas vía Madrid."
+    "Compara vuelos directos con billetes Train&Fly vía Madrid, "
+    "con búsqueda por rangos de fechas."
+)
+
+direction_label = st.selectbox(
+    "Sentido del viaje",
+    [
+        "BRU → España / España → BRU",
+        "España → BRU / BRU → España",
+    ],
+    index=0,
 )
 
 st.subheader("Fechas")
@@ -287,7 +333,7 @@ total_combinations = (
 
 st.info(
     f"Cada ruta probará {total_combinations} combinaciones de fechas. "
-    "Más estaciones = más consultas SerpApi. La humanidad inventó las cuotas API para que nadie fuera feliz."
+    "Más estaciones = más consultas SerpApi."
 )
 
 if st.button("Buscar mejores precios", type="primary"):
@@ -296,60 +342,63 @@ if st.button("Buscar mejores precios", type="primary"):
     errors_rows = []
 
     progress = st.progress(0)
-    total_jobs = 1 + len(selected_stations)
+    total_jobs = len(selected_stations) * 2
     current_job = 0
 
-    # Référence BRU ↔ MAD
-    current_job += 1
-    progress.progress(current_job / total_jobs)
-
-    with st.status("Buscando referencia BRU ↔ MAD..."):
-        ref_best, ref_all, ref_errors = search_best_roundtrip_range(
-            origin="BRU",
-            destination="MAD",
-            outbound_start=outbound_start,
-            outbound_end=outbound_end,
-            return_start=return_start,
-            return_end=return_end,
-            label="REFERENCIA BRU-MAD",
-        )
-
-        all_rows.extend(ref_all)
-
-        if ref_errors:
-            errors_rows.append({
-                "ruta": "BRU-MAD",
-                "errores": " | ".join(ref_errors[:5]),
-            })
-
-    ref_price = ref_best["precio"] if ref_best else None
-
     for station in selected_stations:
+        code = station["code"]
+        city = station["city"]
+        routes = make_routes(direction_label, code)
+
         current_job += 1
         progress.progress(current_job / total_jobs)
 
-        code = station["code"]
-        city = station["city"]
-
-        with st.status(f"Buscando BRU ↔ {city} ({code})..."):
-            combo_best, combo_all, combo_errors = search_best_roundtrip_range(
-                origin="BRU",
-                destination=code,
+        with st.status(
+            f"Buscando referencia {routes['ref_origin']} ↔ {routes['ref_destination']}..."
+        ):
+            ref_best, ref_all, ref_errors = search_best_roundtrip_range(
+                origin=routes["ref_origin"],
+                destination=routes["ref_destination"],
                 outbound_start=outbound_start,
                 outbound_end=outbound_end,
                 return_start=return_start,
                 return_end=return_end,
-                label=f"TRAINFLY BRU-{code}",
+                label=f"REFERENCIA {routes['ref_origin']}-{routes['ref_destination']}",
+            )
+
+            all_rows.extend(ref_all)
+
+            if ref_errors:
+                errors_rows.append({
+                    "ruta": f"{routes['ref_origin']}-{routes['ref_destination']}",
+                    "errores": " | ".join(ref_errors[:5]),
+                })
+
+        current_job += 1
+        progress.progress(current_job / total_jobs)
+
+        with st.status(
+            f"Buscando Train&Fly {routes['combo_origin']} ↔ {routes['combo_destination']}..."
+        ):
+            combo_best, combo_all, combo_errors = search_best_roundtrip_range(
+                origin=routes["combo_origin"],
+                destination=routes["combo_destination"],
+                outbound_start=outbound_start,
+                outbound_end=outbound_end,
+                return_start=return_start,
+                return_end=return_end,
+                label=f"TRAINFLY {routes['combo_origin']}-{routes['combo_destination']}",
             )
 
             all_rows.extend(combo_all)
 
             if combo_errors:
                 errors_rows.append({
-                    "ruta": f"BRU-{code}",
+                    "ruta": f"{routes['combo_origin']}-{routes['combo_destination']}",
                     "errores": " | ".join(combo_errors[:5]),
                 })
 
+        ref_price = ref_best["precio"] if ref_best else None
         combo_price = combo_best["precio"] if combo_best else None
 
         difference = None
@@ -364,9 +413,12 @@ if st.button("Buscar mejores precios", type="primary"):
             )
 
         summary_rows.append({
+            "sentido": routes["direction_short"],
             "estacion": city,
             "codigo": code,
-            "precio_referencia_BRU_MAD": ref_price,
+            "ruta_referencia": f"{routes['ref_origin']} ↔ {routes['ref_destination']}",
+            "ruta_trainfly": f"{routes['combo_origin']} ↔ {routes['combo_destination']}",
+            "precio_referencia": ref_price,
             "fecha_ida_ref": ref_best.get("fecha_ida") if ref_best else "",
             "fecha_vuelta_ref": ref_best.get("fecha_vuelta") if ref_best else "",
             "precio_trainfly_minimo": combo_price,
@@ -374,7 +426,16 @@ if st.button("Buscar mejores precios", type="primary"):
             "fecha_vuelta_trainfly": combo_best.get("fecha_vuelta") if combo_best else "",
             "diferencia": difference,
             "estado": status,
-            "enlace_google_flights": combo_best.get("enlace_google_flights") if combo_best else google_flights_link("BRU", code, outbound_start.isoformat(), return_start.isoformat()),
+            "enlace_google_flights": (
+                combo_best.get("enlace_google_flights")
+                if combo_best
+                else google_flights_link(
+                    routes["combo_origin"],
+                    routes["combo_destination"],
+                    outbound_start.isoformat(),
+                    return_start.isoformat(),
+                )
+            ),
         })
 
     df_summary = pd.DataFrame(summary_rows)
