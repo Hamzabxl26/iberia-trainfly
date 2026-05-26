@@ -1,10 +1,15 @@
 import os
-import requests
-import pandas as pd
-import streamlit as st
 from datetime import date, timedelta
+from urllib.parse import quote_plus
 
-# ---------- CONFIG ----------
+import pandas as pd
+import requests
+import streamlit as st
+
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 try:
     SERPAPI_KEY = st.secrets.get("SERPAPI_KEY")
@@ -45,7 +50,9 @@ STATIONS = [
 ]
 
 
-# ---------- HELPERS ----------
+# ============================================================
+# HELPERS
+# ============================================================
 
 def daterange(start_date, end_date):
     current = start_date
@@ -63,10 +70,10 @@ def google_flights_link(origin, destination, outbound_date, return_date=None):
     else:
         query = f"Flights from {origin} to {destination} on {outbound_date}"
 
-    return "https://www.google.com/travel/flights?q=" + query.replace(" ", "%20")
+    return "https://www.google.com/travel/flights?q=" + quote_plus(query)
 
 
-def serpapi_google_flights(origin, destination, outbound_date, return_date=None):
+def serpapi_google_flights(origin, destination, outbound_date, return_date=None, departure_token=None):
     if not SERPAPI_KEY:
         raise RuntimeError("Falta la SERPAPI_KEY.")
 
@@ -89,6 +96,9 @@ def serpapi_google_flights(origin, destination, outbound_date, return_date=None)
     else:
         params["type"] = "2"
 
+    if departure_token:
+        params["departure_token"] = departure_token
+
     response = requests.get(
         "https://serpapi.com/search",
         params=params,
@@ -98,7 +108,62 @@ def serpapi_google_flights(origin, destination, outbound_date, return_date=None)
     return response.json()
 
 
-def flatten_results(data, origin, destination, outbound_date, return_date, label):
+def summarize_segments(flights):
+    if not flights:
+        return {
+            "salida": "",
+            "llegada": "",
+            "duracion_min": "",
+            "companias": "",
+            "vuelos": "",
+            "itinerario": "",
+        }
+
+    first = flights[0]
+    last = flights[-1]
+
+    airlines = []
+    flight_numbers = []
+    itinerary = []
+
+    for flight in flights:
+        dep = flight.get("departure_airport", {}) or {}
+        arr = flight.get("arrival_airport", {}) or {}
+
+        airline = flight.get("airline", "")
+        flight_number = flight.get("flight_number", "")
+        duration = flight.get("duration", "")
+
+        if airline:
+            airlines.append(airline)
+        if flight_number:
+            flight_numbers.append(flight_number)
+
+        itinerary.append(
+            f"{dep.get('id', '')} {dep.get('time', '')} → "
+            f"{arr.get('id', '')} {arr.get('time', '')}"
+            + (f" ({duration} min)" if duration else "")
+        )
+
+    duration_sum = 0
+    has_duration = False
+    for flight in flights:
+        duration = flight.get("duration")
+        if isinstance(duration, int):
+            duration_sum += duration
+            has_duration = True
+
+    return {
+        "salida": (first.get("departure_airport", {}) or {}).get("time", ""),
+        "llegada": (last.get("arrival_airport", {}) or {}).get("time", ""),
+        "duracion_min": duration_sum if has_duration else "",
+        "companias": ", ".join(sorted(set(airlines))),
+        "vuelos": ", ".join(flight_numbers),
+        "itinerario": " | ".join(itinerary),
+    }
+
+
+def flatten_outbound_results(data, origin, destination, outbound_date, return_date, label, trip_type):
     rows = []
 
     blocks = []
@@ -113,47 +178,68 @@ def flatten_results(data, origin, destination, outbound_date, return_date, label
         if not flights:
             continue
 
-        first = flights[0]
-        last = flights[-1]
-
-        airlines = []
-        flight_numbers = []
-        itinerary = []
-
-        for flight in flights:
-            dep = flight.get("departure_airport", {}) or {}
-            arr = flight.get("arrival_airport", {}) or {}
-
-            airline = flight.get("airline", "")
-            flight_number = flight.get("flight_number", "")
-
-            if airline:
-                airlines.append(airline)
-            if flight_number:
-                flight_numbers.append(flight_number)
-
-            itinerary.append(
-                f"{dep.get('id', '')} {dep.get('time', '')} → "
-                f"{arr.get('id', '')} {arr.get('time', '')}"
-            )
+        ida = summarize_segments(flights)
 
         rows.append({
             "tipo_busqueda": label,
+            "tipo_viaje": trip_type,
             "origen": origin,
             "destino": destination,
             "fecha_ida": outbound_date,
             "fecha_vuelta": return_date or "",
             "precio": price,
             "moneda": "EUR",
-            "salida": (first.get("departure_airport", {}) or {}).get("time", ""),
-            "llegada": (last.get("arrival_airport", {}) or {}).get("time", ""),
-            "duracion_min": total_duration,
-            "companias": ", ".join(sorted(set(airlines))),
-            "vuelos": ", ".join(flight_numbers),
-            "itinerario": " | ".join(itinerary),
+            "duracion_total_min": total_duration,
+
+            "ida_salida": ida["salida"],
+            "ida_llegada": ida["llegada"],
+            "ida_duracion_min": ida["duracion_min"],
+            "ida_companias": ida["companias"],
+            "ida_vuelos": ida["vuelos"],
+            "ida_itinerario": ida["itinerario"],
+
+            "vuelta_salida": "",
+            "vuelta_llegada": "",
+            "vuelta_duracion_min": "",
+            "vuelta_companias": "",
+            "vuelta_vuelos": "",
+            "vuelta_itinerario": "",
+
+            "booking_token": block.get("booking_token", "") or "",
+            "departure_token": block.get("departure_token", "") or "",
+            "return_booking_token": "",
             "enlace_google_flights": google_flights_link(
                 origin, destination, outbound_date, return_date
             ),
+        })
+
+    return rows
+
+
+def flatten_return_results(data):
+    rows = []
+
+    blocks = []
+    blocks.extend(data.get("best_flights", []) or [])
+    blocks.extend(data.get("other_flights", []) or [])
+
+    for block in blocks:
+        flights = block.get("flights", []) or []
+        if not flights:
+            continue
+
+        vuelta = summarize_segments(flights)
+
+        rows.append({
+            "precio": block.get("price"),
+            "duracion_total_min": block.get("total_duration"),
+            "vuelta_salida": vuelta["salida"],
+            "vuelta_llegada": vuelta["llegada"],
+            "vuelta_duracion_min": vuelta["duracion_min"],
+            "vuelta_companias": vuelta["companias"],
+            "vuelta_vuelos": vuelta["vuelos"],
+            "vuelta_itinerario": vuelta["itinerario"],
+            "booking_token": block.get("booking_token", "") or "",
         })
 
     return rows
@@ -164,13 +250,61 @@ def best_row(rows):
         row for row in rows
         if isinstance(row.get("precio"), (int, float))
     ]
+
     if not valid:
         return None
 
     return min(valid, key=lambda row: row["precio"])
 
 
-def search_best_roundtrip_range(
+def enrich_rows_with_return_details(rows):
+    enriched = []
+
+    for row in rows:
+        if row.get("tipo_viaje") != "Ida y vuelta":
+            enriched.append(row)
+            continue
+
+        departure_token = row.get("departure_token")
+        return_date = row.get("fecha_vuelta")
+
+        if not departure_token or not return_date:
+            enriched.append(row)
+            continue
+
+        try:
+            data = serpapi_google_flights(
+                origin=row["origen"],
+                destination=row["destino"],
+                outbound_date=row["fecha_ida"],
+                return_date=return_date,
+                departure_token=departure_token,
+            )
+
+            return_rows = flatten_return_results(data)
+            best_return = best_row(return_rows)
+
+            if best_return:
+                row["vuelta_salida"] = best_return.get("vuelta_salida", "")
+                row["vuelta_llegada"] = best_return.get("vuelta_llegada", "")
+                row["vuelta_duracion_min"] = best_return.get("vuelta_duracion_min", "")
+                row["vuelta_companias"] = best_return.get("vuelta_companias", "")
+                row["vuelta_vuelos"] = best_return.get("vuelta_vuelos", "")
+                row["vuelta_itinerario"] = best_return.get("vuelta_itinerario", "")
+                row["return_booking_token"] = best_return.get("booking_token", "")
+
+                if isinstance(best_return.get("precio"), (int, float)):
+                    row["precio"] = best_return["precio"]
+
+        except Exception as exc:
+            row["vuelta_itinerario"] = f"Error vuelta: {exc}"
+
+        enriched.append(row)
+
+    return enriched
+
+
+def search_best_range(
     origin,
     destination,
     outbound_start,
@@ -178,13 +312,18 @@ def search_best_roundtrip_range(
     return_start,
     return_end,
     label,
+    trip_type,
 ):
     all_rows = []
     best = None
     errors = []
 
     outbound_dates = list(daterange(outbound_start, outbound_end))
-    return_dates = list(daterange(return_start, return_end))
+
+    if trip_type == "Solo ida":
+        return_dates = [None]
+    else:
+        return_dates = list(daterange(return_start, return_end))
 
     for outbound_date in outbound_dates:
         for return_date in return_dates:
@@ -196,14 +335,17 @@ def search_best_roundtrip_range(
                     return_date=return_date,
                 )
 
-                rows = flatten_results(
+                rows = flatten_outbound_results(
                     data=data,
                     origin=origin,
                     destination=destination,
                     outbound_date=outbound_date,
                     return_date=return_date,
                     label=label,
+                    trip_type=trip_type,
                 )
+
+                rows = enrich_rows_with_return_details(rows)
 
                 all_rows.extend(rows)
 
@@ -214,25 +356,13 @@ def search_best_roundtrip_range(
                     best = candidate
 
             except Exception as exc:
-                errors.append(f"{outbound_date}/{return_date}: {exc}")
+                errors.append(f"{outbound_date}/{return_date or ''}: {exc}")
 
     return best, all_rows, errors
 
 
 def make_routes(direction_label, station_code):
-    """
-    Retourne les routes à comparer selon le sens choisi.
-
-    1) BRU → España / España → BRU
-       Référence : BRU ↔ MAD
-       Combo     : BRU ↔ station espagnole
-
-    2) España → BRU / BRU → España
-       Référence : MAD ↔ BRU
-       Combo     : station espagnole ↔ BRU
-    """
-
-    if direction_label == "BRU → España / España → BRU":
+    if direction_label == "BRU → España":
         return {
             "ref_origin": "BRU",
             "ref_destination": "MAD",
@@ -250,7 +380,9 @@ def make_routes(direction_label, station_code):
     }
 
 
-# ---------- UI ----------
+# ============================================================
+# UI
+# ============================================================
 
 st.set_page_config(
     page_title="Comparador Iberia Train&Fly",
@@ -271,11 +403,17 @@ st.caption(
     "con búsqueda por rangos de fechas."
 )
 
+trip_type = st.selectbox(
+    "Tipo de viaje",
+    ["Solo ida", "Ida y vuelta"],
+    index=1,
+)
+
 direction_label = st.selectbox(
     "Sentido del viaje",
     [
-        "BRU → España / España → BRU",
-        "España → BRU / BRU → España",
+        "BRU → España",
+        "España → BRU",
     ],
     index=0,
 )
@@ -289,14 +427,19 @@ with col1:
     outbound_end = st.date_input("Ida hasta", value=date(2026, 7, 20))
 
 with col2:
-    return_start = st.date_input("Vuelta desde", value=date(2026, 7, 22))
-    return_end = st.date_input("Vuelta hasta", value=date(2026, 7, 25))
+    if trip_type == "Ida y vuelta":
+        return_start = st.date_input("Vuelta desde", value=date(2026, 7, 22))
+        return_end = st.date_input("Vuelta hasta", value=date(2026, 7, 25))
+    else:
+        return_start = None
+        return_end = None
+        st.info("Viaje de solo ida: no se usa fecha de vuelta.")
 
 if outbound_end < outbound_start:
     st.error("La fecha final de ida debe ser posterior o igual a la fecha inicial.")
     st.stop()
 
-if return_end < return_start:
+if trip_type == "Ida y vuelta" and return_end < return_start:
     st.error("La fecha final de vuelta debe ser posterior o igual a la fecha inicial.")
     st.stop()
 
@@ -325,11 +468,14 @@ st.warning(
     "Si una estación no devuelve resultados, puede venir de Google, no necesariamente de Iberia."
 )
 
-total_combinations = (
-    (outbound_end - outbound_start).days + 1
-) * (
-    (return_end - return_start).days + 1
-)
+outbound_count = (outbound_end - outbound_start).days + 1
+
+if trip_type == "Ida y vuelta":
+    return_count = (return_end - return_start).days + 1
+else:
+    return_count = 1
+
+total_combinations = outbound_count * return_count
 
 st.info(
     f"Cada ruta probará {total_combinations} combinaciones de fechas. "
@@ -342,7 +488,7 @@ if st.button("Buscar mejores precios", type="primary"):
     errors_rows = []
 
     progress = st.progress(0)
-    total_jobs = len(selected_stations) * 2
+    total_jobs = max(len(selected_stations) * 2, 1)
     current_job = 0
 
     for station in selected_stations:
@@ -354,9 +500,9 @@ if st.button("Buscar mejores precios", type="primary"):
         progress.progress(current_job / total_jobs)
 
         with st.status(
-            f"Buscando referencia {routes['ref_origin']} ↔ {routes['ref_destination']}..."
+            f"Buscando referencia {routes['ref_origin']} → {routes['ref_destination']}..."
         ):
-            ref_best, ref_all, ref_errors = search_best_roundtrip_range(
+            ref_best, ref_all, ref_errors = search_best_range(
                 origin=routes["ref_origin"],
                 destination=routes["ref_destination"],
                 outbound_start=outbound_start,
@@ -364,6 +510,7 @@ if st.button("Buscar mejores precios", type="primary"):
                 return_start=return_start,
                 return_end=return_end,
                 label=f"REFERENCIA {routes['ref_origin']}-{routes['ref_destination']}",
+                trip_type=trip_type,
             )
 
             all_rows.extend(ref_all)
@@ -378,9 +525,9 @@ if st.button("Buscar mejores precios", type="primary"):
         progress.progress(current_job / total_jobs)
 
         with st.status(
-            f"Buscando Train&Fly {routes['combo_origin']} ↔ {routes['combo_destination']}..."
+            f"Buscando Train&Fly {routes['combo_origin']} → {routes['combo_destination']}..."
         ):
-            combo_best, combo_all, combo_errors = search_best_roundtrip_range(
+            combo_best, combo_all, combo_errors = search_best_range(
                 origin=routes["combo_origin"],
                 destination=routes["combo_destination"],
                 outbound_start=outbound_start,
@@ -388,6 +535,7 @@ if st.button("Buscar mejores precios", type="primary"):
                 return_start=return_start,
                 return_end=return_end,
                 label=f"TRAINFLY {routes['combo_origin']}-{routes['combo_destination']}",
+                trip_type=trip_type,
             )
 
             all_rows.extend(combo_all)
@@ -413,29 +561,48 @@ if st.button("Buscar mejores precios", type="primary"):
             )
 
         summary_rows.append({
+            "tipo_viaje": trip_type,
             "sentido": routes["direction_short"],
             "estacion": city,
             "codigo": code,
-            "ruta_referencia": f"{routes['ref_origin']} ↔ {routes['ref_destination']}",
-            "ruta_trainfly": f"{routes['combo_origin']} ↔ {routes['combo_destination']}",
+            "ruta_referencia": f"{routes['ref_origin']} → {routes['ref_destination']}",
+            "ruta_trainfly": f"{routes['combo_origin']} → {routes['combo_destination']}",
+
             "precio_referencia": ref_price,
             "fecha_ida_ref": ref_best.get("fecha_ida") if ref_best else "",
             "fecha_vuelta_ref": ref_best.get("fecha_vuelta") if ref_best else "",
+            "ida_salida_ref": ref_best.get("ida_salida") if ref_best else "",
+            "ida_llegada_ref": ref_best.get("ida_llegada") if ref_best else "",
+            "ida_itinerario_ref": ref_best.get("ida_itinerario") if ref_best else "",
+            "vuelta_salida_ref": ref_best.get("vuelta_salida") if ref_best else "",
+            "vuelta_llegada_ref": ref_best.get("vuelta_llegada") if ref_best else "",
+            "vuelta_itinerario_ref": ref_best.get("vuelta_itinerario") if ref_best else "",
+
             "precio_trainfly_minimo": combo_price,
             "fecha_ida_trainfly": combo_best.get("fecha_ida") if combo_best else "",
             "fecha_vuelta_trainfly": combo_best.get("fecha_vuelta") if combo_best else "",
+            "ida_salida_trainfly": combo_best.get("ida_salida") if combo_best else "",
+            "ida_llegada_trainfly": combo_best.get("ida_llegada") if combo_best else "",
+            "ida_itinerario_trainfly": combo_best.get("ida_itinerario") if combo_best else "",
+            "vuelta_salida_trainfly": combo_best.get("vuelta_salida") if combo_best else "",
+            "vuelta_llegada_trainfly": combo_best.get("vuelta_llegada") if combo_best else "",
+            "vuelta_itinerario_trainfly": combo_best.get("vuelta_itinerario") if combo_best else "",
+
             "diferencia": difference,
             "estado": status,
-            "enlace_google_flights": (
+            "enlace_google_flights_opcion": (
                 combo_best.get("enlace_google_flights")
                 if combo_best
                 else google_flights_link(
                     routes["combo_origin"],
                     routes["combo_destination"],
                     outbound_start.isoformat(),
-                    return_start.isoformat(),
+                    return_start.isoformat() if return_start else None,
                 )
             ),
+            "booking_token": combo_best.get("booking_token") if combo_best else "",
+            "departure_token": combo_best.get("departure_token") if combo_best else "",
+            "return_booking_token": combo_best.get("return_booking_token") if combo_best else "",
         })
 
     df_summary = pd.DataFrame(summary_rows)
